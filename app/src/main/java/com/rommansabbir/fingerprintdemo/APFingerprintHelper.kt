@@ -186,8 +186,6 @@ object APFingerprintHelper {
     fun verifyFingerprint(existingTemplate: ByteArray, onResult: (ReadFingerprintResult) -> Unit) {
         tryCatch(
             {
-                jsgfpLib?.SetTemplateFormat(SGFDxTemplateFormat.TEMPLATE_FORMAT_ANSI378)
-
                 var currentSnap: ByteArray? = null
                 readFingerprint {
                     if (it.errorMessage.isNullOrEmpty()) {
@@ -196,6 +194,10 @@ object APFingerprintHelper {
                         onResult.invoke(it)
                         return@readFingerprint
                     }
+                }
+
+                if (currentSnap == null){
+                    return@tryCatch
                 }
 
                 val matched = BooleanArray(1)
