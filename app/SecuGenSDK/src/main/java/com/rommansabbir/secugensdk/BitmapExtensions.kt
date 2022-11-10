@@ -1,4 +1,4 @@
-package com.rommansabbir.fingerprintdemo
+package com.rommansabbir.secugensdk
 
 import android.graphics.Bitmap
 import java.nio.ByteBuffer
