@@ -8,32 +8,28 @@ import android.content.Context
 import android.content.Context.USB_SERVICE
 import android.content.Intent
 import android.content.IntentFilter
-import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import android.os.Parcelable
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 
 interface FingerprintManager {
     fun onCreated(activity: Activity)
     suspend fun onResume(
         activity: Activity,
-        templateType: FingerprintTemplateType,
         onDeviceNotFound: (isFound: Boolean) -> Unit,
         onSenorNotFound: () -> Unit
     )
 
     fun onPause(activity: Activity)
     fun onDestroy(activity: Activity)
-    fun readFingerprint(templateType: FingerprintTemplateType): Pair<ReadFingerprintResult?, Exception?>
+    fun readFingerprint(): Pair<ReadFingerprintResult?, Exception?>
     fun verifyFingerprint(
-        matchingTemplate: ByteArray,
-        templateType: FingerprintTemplateType
+        matchingTemplate: ByteArray
     ): Pair<Boolean, Exception?>
 }
 
-class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
+class FingerprintManagerImpl(
+    private val templateType: FingerprintTemplateType,
+    private val matchingThreshold: Int = 60
+) : FingerprintManager, SGFingerPresentEvent {
     var height: Int = 0
         private set
     var width: Int = 0
@@ -48,9 +44,10 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
     private var sgfplib: JSGFPLib? = null
     private var filter: IntentFilter? = null
     private var autoOn: SGAutoOnEventNotifier? = null
-    private var usbPermissionRequested = false
-    private var bSecuGenDeviceOpened = false
+
     private var mPermissionIntent: PendingIntent? = null
+    private var sensorNotFound: () -> Unit = {}
+    private var deviceError: (isFound: Boolean) -> Unit = {}
 
 
     //This broadcast receiver is necessary to get user permissions to access the attached USB device
@@ -61,21 +58,38 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
             //Log.d(TAG,"Enter mUsbReceiver.onReceive()");
             if (ACTION_USB_PERMISSION == action) {
                 synchronized(this) {
-                    val device =
-                        intent.getParcelableExtra<Parcelable>(UsbManager.EXTRA_DEVICE) as UsbDevice?
-                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
-                        if (device != null) {
-                            //DEBUG Log.d(TAG, "Vendor ID : " + device.getVendorId() + "\n");
-                            //DEBUG Log.d(TAG, "Product ID: " + device.getProductId() + "\n");
+                    try {
+                        if (sgfplib != null) {
+                            val error = sgfplib!!.OpenDevice(0)
+                            if (error == SGFDxErrorCode.SGFDX_ERROR_NONE) {
+                                /*bSecuGenDeviceOpened = true*/
+                                sgfplib?.SetBrightness(100)
+                                setTemplate(templateType)
+                                sgfplib?.GetMaxTemplateSize(maxTemplateSize)
+                                val deviceInfo = SGDeviceInfoParam()
+                                if (sgfplib != null) {
+                                    val res = sgfplib?.GetDeviceInfo(deviceInfo)
+                                    if (res == SGFDxErrorCode.SGFDX_ERROR_NONE) {
+                                        height = deviceInfo.imageHeight
+                                        width = deviceInfo.imageWidth
+                                        dpi = deviceInfo.imageDPI
+                                    }
+                                }
+                                autoOn!!.start()
+                            } else {
+                                deviceError.invoke(false)
+                            }
                         } else {
+                            deviceError.invoke(false)
                         }
-                    } else {
+                    } catch (e: RuntimeException) {
+                        e.printStackTrace()
+                        deviceError.invoke(false)
                     }
                 }
             }
         }
     }
-
 
     override fun onCreated(activity: Activity) {
         //USB Permissions
@@ -87,76 +101,37 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
         )
         filter = IntentFilter(ACTION_USB_PERMISSION)
         sgfplib = JSGFPLib(activity, activity.getSystemService(USB_SERVICE) as UsbManager)
-        bSecuGenDeviceOpened = false
-        usbPermissionRequested = false
         autoOn = SGAutoOnEventNotifier(sgfplib, this)
     }
 
     override suspend fun onResume(
         activity: Activity,
-        templateType: FingerprintTemplateType,
         onDeviceNotFound: (isFound: Boolean) -> Unit,
         onSenorNotFound: () -> Unit
     ) {
         // Register USB Checker
-        var error = (sgfplib?.Init(SGFDxDeviceName.SG_DEV_AUTO))
-        when (error != SGFDxErrorCode.SGFDX_ERROR_NONE) {
-            true -> {
-                onDeviceNotFound.invoke(error == SGFDxErrorCode.SGFDX_ERROR_DEVICE_NOT_FOUND)
-            }
-            else -> {
-                sgfplib?.GetUsbDevice()?.let { it ->
-                    // Check for connected device
-                    var hasPermission = sgfplib?.GetUsbManager()?.hasPermission(it) ?: false
+        this.sensorNotFound = onSenorNotFound
+        this.deviceError = onDeviceNotFound
+        activity.registerReceiver(mUsbReceiver, filter)
 
-                    if (!hasPermission) {
-                        if (!usbPermissionRequested) {
-                            usbPermissionRequested = true
-                            sgfplib!!.GetUsbManager()
-                                .requestPermission(it, mPermissionIntent)
-                        } else {
-                            //wait up to 20 seconds for the system to grant USB permission
-                            hasPermission = sgfplib!!.GetUsbManager().hasPermission(it)
-                            withContext(Dispatchers.Default) {
-                                var i = 0
-                                while (!hasPermission && i <= 40) {
-                                    ++i
-                                    hasPermission =
-                                        sgfplib!!.GetUsbManager().hasPermission(it)
-                                    delay(500)
-                                }
-                            }
-                        }
+        //
+        try {
+            val error = (sgfplib?.Init(SGFDxDeviceName.SG_DEV_AUTO))
+            when (error != SGFDxErrorCode.SGFDX_ERROR_NONE) {
+                true -> {
+                    onDeviceNotFound.invoke(error == SGFDxErrorCode.SGFDX_ERROR_DEVICE_NOT_FOUND)
+                }
+                else -> {
+                    try {
+                        val usbDevice = sgfplib?.GetUsbDevice()
+                        sgfplib?.GetUsbManager()?.requestPermission(usbDevice, mPermissionIntent)
+                    } catch (e: Exception) {
+                        sensorNotFound.invoke()
                     }
-
-                    if (hasPermission) {
-                        error = sgfplib!!.OpenDevice(0)
-                        if (error == SGFDxErrorCode.SGFDX_ERROR_NONE) {
-                            bSecuGenDeviceOpened = true
-
-                            sgfplib?.SetBrightness(100)
-                            setTemplate(templateType)
-                            sgfplib?.GetMaxTemplateSize(maxTemplateSize)
-                            val deviceInfo = SGDeviceInfoParam()
-                            if (sgfplib != null) {
-                                val res = sgfplib?.GetDeviceInfo(deviceInfo)
-                                if (res == SGFDxErrorCode.SGFDX_ERROR_NONE) {
-                                    height = deviceInfo.imageHeight
-                                    width = deviceInfo.imageWidth
-                                    dpi = deviceInfo.imageDPI
-                                }
-                            }
-
-                            autoOn!!.start()
-                        } else {
-                            // Waiting for Permission
-                        }
-                    }
-                } ?: kotlin.run {
-                    // Fingerprint device not found
-                    onSenorNotFound.invoke()
                 }
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -170,8 +145,12 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
         try {
             autoOn?.stop()
             sgfplib?.CloseDevice()
-            activity.unregisterReceiver(mUsbReceiver)
-        } catch (e: Exception) {
+            try {
+                activity.unregisterReceiver(mUsbReceiver)
+            } catch (e: IllegalArgumentException) {
+                e.printStackTrace()
+            }
+        } catch (e: RuntimeException) {
             e.printStackTrace()
         }
     }
@@ -180,7 +159,7 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
         try {
             sgfplib?.CloseDevice()
             sgfplib?.Close()
-        } catch (e: java.lang.Exception) {
+        } catch (e: RuntimeException) {
             e.printStackTrace()
         }
     }
@@ -194,7 +173,7 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
         return fingerInfo
     }
 
-    override fun readFingerprint(templateType: FingerprintTemplateType): Pair<ReadFingerprintResult?, Exception?> {
+    override fun readFingerprint(): Pair<ReadFingerprintResult?, Exception?> {
         if (sgfplib == null) {
             return Pair(null, Exception("Not initialized"))
         }
@@ -244,7 +223,7 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
             if (verifyError != SGFDxErrorCode.SGFDX_ERROR_NONE) {
                 return Pair(null, Exception("Image quality is too low. Scan again."))
             }
-            return if (qualityVerify[0] < 80) {
+            return if (qualityVerify[0] < matchingThreshold) {
                 Pair(null, Exception("Image quality is too low. Scan again."))
             } else {
                 // Return the success result
@@ -266,11 +245,8 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
         }
     }
 
-    override fun verifyFingerprint(
-        matchingTemplate: ByteArray,
-        templateType: FingerprintTemplateType
-    ): Pair<Boolean, Exception?> {
-        val scanResult = readFingerprint(templateType)
+    override fun verifyFingerprint(matchingTemplate: ByteArray): Pair<Boolean, Exception?> {
+        val scanResult = readFingerprint()
         if (scanResult.second != null) {
             return Pair(false, scanResult.second)
         }
@@ -371,7 +347,7 @@ class FingerprintManagerImpl : FingerprintManager, SGFingerPresentEvent {
                 }
             }
             return Pair(matched[0], null)
-        } catch (e: Exception) {
+        } catch (e: RuntimeException) {
             return Pair(false, e)
         }
     }
