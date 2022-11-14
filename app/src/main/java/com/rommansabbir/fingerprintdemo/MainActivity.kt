@@ -23,7 +23,7 @@ class MainActivity : AppCompatActivity() {
         binding = DataBindingUtil.setContentView(this, R.layout.activity_main)
 
         //
-        fingerprintManager = FingerprintManagerImpl()
+        fingerprintManager = FingerprintManagerImpl(templateType)
         fingerprintManager.onCreated(this)
 
         binding.button.setOnClickListener { captureFingerprint() }
@@ -34,7 +34,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         lifecycleScope.launch {
             fingerprintManager.onResume(
-                this@MainActivity, templateType,
+                this@MainActivity,
                 {
                     // Fingerprint device not supported for this device
                     val dlgAlert = AlertDialog.Builder(this@MainActivity)
@@ -87,49 +87,45 @@ class MainActivity : AppCompatActivity() {
     private var ext: ByteArray? = null
 
     private fun captureFingerprint() {
-        lifecycleScope.launch {
-            ext = null
-            val result = fingerprintManager.readFingerprint(templateType)
+        ext = null
+        val result = fingerprintManager.readFingerprint()
+        if (result.second != null) {
+            Toast.makeText(
+                this@MainActivity,
+                result.second?.localizedMessage?.toString(),
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        if (result.first == null) {
+            Toast.makeText(
+                this@MainActivity,
+                "Scan result not found",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        ext = result.first!!.template
+        binding.mImageViewFingerprint.setImageBitmap(result.first!!.bitmap)
+    }
+
+    private fun verifyFingerPrint() {
+        ext?.let { bytes ->
+            val result = fingerprintManager.verifyFingerprint(
+                bytes
+            )
             if (result.second != null) {
                 Toast.makeText(
                     this@MainActivity,
                     result.second?.localizedMessage?.toString(),
                     Toast.LENGTH_SHORT
                 ).show()
-                return@launch
+                return
             }
-            if (result.first == null) {
-                Toast.makeText(
-                    this@MainActivity,
-                    "Scan result not found",
-                    Toast.LENGTH_SHORT
-                ).show()
-                return@launch
-            }
-            ext = result.first!!.template
-            binding.mImageViewFingerprint.setImageBitmap(result.first!!.bitmap)
-        }
-    }
-
-    private fun verifyFingerPrint() {
-        lifecycleScope.launch {
-            ext?.let { bytes ->
-                val result = fingerprintManager.verifyFingerprint(
-                    bytes,
-                    templateType
-                )
-                if (result.second != null) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        result.second?.localizedMessage?.toString(),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    return@launch
-                }
-                Toast.makeText(this@MainActivity, "Matched : ${result.first}", Toast.LENGTH_SHORT)
-                    .show()
-            }
-        }
+            Toast.makeText(this@MainActivity, "Matched : ${result.first}", Toast.LENGTH_SHORT)
+                .show()
+        } ?: kotlin.run {  Toast.makeText(this@MainActivity, "Matched : Payload missing", Toast.LENGTH_SHORT)
+            .show() }
 
     }
 }
